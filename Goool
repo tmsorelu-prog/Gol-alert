@@ -1,0 +1,315 @@
+import asyncio
+import logging
+import os
+from typing import Dict, Optional
+
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+from monitor import Watcher, Profile
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("bot")
+
+# chat_id -> Watcher task
+WATCHERS: Dict[int, Watcher] = {}
+
+HELP_TEXT = (
+    "Salut! Trimite-mi linkul unui meci 365Scores și eu îl monitorizez.\n\n"
+    "Comenzi:\n"
+    "  /start – începe conversația\n"
+    "  /watch <link> [profil] – pornesc monitorizarea (profil: agresiv | echilibrat | conservator)\n"
+    "  /stop – opresc monitorizarea curentă\n"
+    "  /status – arăt starea curentă\n\n"
+    "Exemplu:\n"
+    "/watch https://www.365scores.com/en-uk/football/match/tff-1.-league-81/keciorengucu-pendikspor-7673-10005-81#id=4477765 echilibrat"
+)
+
+def parse_profile(text: Optional[str]) -> Profile:
+    if not text:
+        return Profile.ECHILIBRAT
+    t = text.strip().lower()
+    if t.startswith("agre"):
+        return Profile.AGRESIV
+    if t.startswith("con"):
+        return Profile.CONSERVATOR
+    return Profile.ECHILIBRAT
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT)
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    w = WATCHERS.get(update.effective_chat.id)
+    if not w:
+        await update.message.reply_text("Nu monitorizez nimic momentan. Folosește /watch <link>.")
+        return
+    await update.message.reply_text(w.human_status())
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    w = WATCHERS.pop(chat_id, None)
+    if w:
+        await w.stop()
+        await update.message.reply_text("Am oprit monitorizarea.")
+    else:
+        await update.message.reply_text("Nu am nimic de oprit.")
+
+async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    args = context.args
+
+    if not args:
+        await update.message.reply_text("Te rog: /watch <link_365scores> [profil]")
+        return
+
+    link = args[0]
+    prof = parse_profile(args[1] if len(args) > 1 else None)
+
+    # opresc vechiul watcher dacă există
+    old = WATCHERS.pop(chat_id, None)
+    if old:
+        await old.stop()
+
+    w = Watcher(
+        url=link,
+        chat_id=chat_id,
+        send_fn=lambda msg: context.bot.send_message(chat_id, msg),
+        profile=prof,
+    )
+    WATCHERS[chat_id] = w
+    await update.message.reply_text(f"Pornesc monitorizarea pe:\n{link}\nProfil: {prof.value}…")
+    asyncio.create_task(w.run())
+
+async def main():
+    token = os.environ.get("BOT_TOKEN")
+    if not token:
+        raise SystemExit("Lipsește variabila de mediu BOT_TOKEN")
+
+    app = Application.builder().token(token).concurrent_updates(True).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("watch", watch))
+    app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(CommandHandler("status", status))
+
+    log.info("Bot pornit.")
+    await app.run_polling(close_loop=False)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+import asyncio
+import contextlib
+import re
+import time
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional, Tuple
+
+import aiohttp
+from bs4 import BeautifulSoup
+
+# ——— PROFILURI / PRAGURI ———
+class Profile(Enum):
+    AGRESIV = "agresiv"
+    ECHILIBRAT = "echilibrat"
+    CONSERVATOR = "conservator"
+
+PROFILE_THRESH = {
+    Profile.AGRESIV: 0.80,       # alerte mai dese
+    Profile.ECHILIBRAT: 1.00,    # echilibru
+    Profile.CONSERVATOR: 1.30,   # alerte mai rare
+}
+
+REFRESH_SEC = 12          # cât de des citim pagina
+REPEAT_SILENCE_MIN = 5    # nu repeta alerta mai rapid de 5 minute
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
+
+# ——— HELPERI ———
+def parse_score(text: str) -> Optional[Tuple[int, int]]:
+    m = re.search(r"(\d+)\s*[-:]\s*(\d+)", text)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+def parse_minute(text: str) -> Optional[int]:
+    # caută "45’", "90+2’", "min 37"
+    t = text.replace("\xa0", " ")
+    m = re.search(r"(\d{1,3})(?:\+(\d{1,2}))?\s*[’']", t)
+    if m:
+        base = int(m.group(1))
+        extra = int(m.group(2)) if m.group(2) else 0
+        return base + extra
+    m2 = re.search(r"min\s+(\d{1,3})", t, re.IGNORECASE)
+    if m2:
+        return int(m2.group(1))
+    if re.search(r"\bHT\b|\bPAUZĂ\b|\bHALF-TIME\b", t, re.IGNORECASE):
+        return 46
+    return None
+
+def near(label: str, html: str) -> Optional[int]:
+    """
+    Găsește un număr în vecinătatea unui label din 365Scores (fallback robust).
+    Ex: 'Dangerous Attacks', 'On Target', 'Shots on Target'
+    """
+    # 50 de caractere în jurul labelului
+    m = re.search(rf"{re.escape(label)}(.{{0,50}}?)(\d+)", html, re.IGNORECASE | re.DOTALL)
+    if not m:
+        m = re.search(rf"(\d+)(.{{0,50}}?){re.escape(label)}", html, re.IGNORECASE | re.DOTALL)
+        if not m:
+            return None
+        return int(m.group(1))
+    return int(m.group(2))
+
+def compute_pressure(h_da, a_da, h_sot, a_sot, h_att, a_att) -> Tuple[float, str]:
+    """Heuristică simplă → scor presiune + partea dominantă (Gazde/Oaspeți)."""
+    # normalizez:
+    w_da = 1.0
+    w_sot = 1.3
+    w_att = 0.6
+    home = w_da*h_da + w_sot*h_sot + w_att*h_att
+    away = w_da*a_da + w_sot*a_sot + w_att*a_att
+    top_side = "Gazde" if home >= away else "Oaspeți"
+    top_val = max(home, away) / (max(1.0, min(home+away, 12.0)))  # 0..~2
+    return top_val, top_side
+
+@dataclass
+class Watcher:
+    url: str
+    chat_id: int
+    send_fn: callable
+    profile: Profile = Profile.ECHILIBRAT
+
+    # state
+    _stop: bool = False
+    last_alert_min: int = -999
+    last_score: Tuple[int, int] = (-1, -1)
+    started_at: float = time.time()
+
+    def human_status(self) -> str:
+        return f"Monitorizez:\n{self.url}\nProfil={self.profile.value} | prag={PROFILE_THRESH[self.profile]:.2f}"
+
+    async def stop(self):
+        self._stop = True
+
+    async def fetch(self, session: aiohttp.ClientSession) -> str:
+        headers = {"User-Agent": UA, "Accept-Language": "en;q=0.9, ro;q=0.8"}
+        async with session.get(self.url, headers=headers, timeout=20) as r:
+            r.raise_for_status()
+            return await r.text()
+
+    async def run(self):
+        thresh = PROFILE_THRESH[self.profile]
+        await self.send_fn(f"FlashGoalWatch ✅\n{self.human_status()}")
+
+        async with aiohttp.ClientSession() as session:
+            while not self._stop:
+                try:
+                    html = await self.fetch(session)
+                    soup = BeautifulSoup(html, "html.parser")
+                    text = soup.get_text(" ", strip=True)
+
+                    # SCORE & MINUTE (fallback regex pe tot textul)
+                    score = parse_score(text) or self.last_score
+                    minute = parse_minute(text)
+
+                    # Stats importante (folosește fallback „near” pe string-ul HTML brut)
+                    h_da = near("Dangerous Attacks", html) or 0
+                    a_da = 0
+                    # dacă 365Scores listează separat, încearcă „dangerous attacks” de două ori:
+                    # prima apariție ~ gazde, a doua ~ oaspeți
+                    with contextlib.suppress(Exception):
+                        matches = re.findall(r"Dangerous Attacks(.{0,80}?)(\d+)", html, re.IGNORECASE | re.DOTALL)
+                        if len(matches) >= 2:
+                            h_da = int(matches[0][1])
+                            a_da = int(matches[1][1])
+
+                    h_sot = near("On Target", html) or near("Shots on Target", html) or 0
+                    a_sot = 0
+                    with contextlib.suppress(Exception):
+                        matches2 = re.findall(r"(On Target|Shots on Target)(.{0,80}?)(\d+)", html, re.IGNORECASE | re.DOTALL)
+                        if len(matches2) >= 2:
+                            h_sot = int(matches2[0][2]); a_sot = int(matches2[1][2])
+
+                    h_att = near("Attacks", html) or 0
+                    a_att = 0
+                    with contextlib.suppress(Exception):
+                        matches3 = re.findall(r"Attacks(.{0,80}?)(\d+)", html, re.IGNORECASE | re.DOTALL)
+                        if len(matches3) >= 2:
+                            h_att = int(matches3[0][1]); a_att = int(matches3[1][1])
+
+                    pressure, top_side = compute_pressure(h_da, a_da, h_sot, a_sot, h_att, a_att)
+
+                    sc = f"{score[0]}–{score[1]}" if score != (-1,-1) else "?"
+                    m_out = f"{minute}" if minute is not None else "?"
+                    # Log informativ periodic:
+                    await self._maybe_log(minute, sc, pressure, top_side, h_da, a_da, h_sot, a_sot)
+
+                    # ALERTĂ GOL NOU
+                    if self.last_score != (-1, -1) and score != self.last_score:
+                        await self.send_fn(f"⚽️ GOL! S-a schimbat scorul: {self.last_score[0]}–{self.last_score[1]} → {score[0]}–{score[1]} (min {m_out})")
+                        self.last_alert_min = minute or self.last_alert_min
+
+                    self.last_score = score
+
+                    # ALERTĂ POSIBIL GOL
+                    if minute is not None:
+                        too_soon = (minute - self.last_alert_min) < REPEAT_SILENCE_MIN
+                    else:
+                        too_soon = True
+
+                    if not too_soon and pressure >= thresh:
+                        await self.send_fn(
+                            f"🔔 Posibil gol în următoarele minute!\n"
+                            f"Min {m_out} | Presiune {pressure:.2f} ({top_side})\n"
+                            f"DangerousAttacks {h_da}-{a_da} | OnTarget {h_sot}-{a_sot} | Attacks {h_att}-{a_att}"
+                        )
+                        self.last_alert_min = minute or self.last_alert_min
+
+                except Exception as e:
+                    await self.send_fn(f"[WARN] {type(e).__name__}: {e}")
+
+                # ritm de refresh
+                for _ in range(REFRESH_SEC):
+                    if self._stop:
+                        break
+                    await asyncio.sleep(1)
+
+    async def _maybe_log(self, minute, sc, pressure, top_side, h_da, a_da, h_sot, a_sot):
+        # Trimite un mic status rar (la ~60 sec) doar ca heartbeat
+        if int(time.time() - self.started_at) % 60 < REFRESH_SEC:
+            txt = (
+                f"[DBG] {time.strftime('%H:%M:%S')} | min {minute if minute is not None else '?'} | "
+                f"scor {sc} | GPS={pressure:.2f} top={top_side} | "
+                f"DA {h_da}-{a_da} | SoT {h_sot}-{a_sot}"
+            )
+            # log ca mesaj „tăcut” (nu spamăm dacă nu vrei — poți comenta linia)
+            # await self.send_fn(txt)
+            # doar în consolă:
+            print(txt)
+python-telegram-bot==21.4
+aiohttp==3.9.5
+beautifulsoup4==4.12.3
+worker: python bot.py
+# FlashGoalWatch – 365Scores (Telegram Bot)
+
+## Variabile necesare
+- BOT_TOKEN = tokenul primit de la @BotFather
+
+## Deploy pe Railway
+1. Creează un repo cu fișierele din proiect.
+2. Railway → New Project → Deploy from GitHub → selectează repo-ul.
+3. În **Variables** adaugă `BOT_TOKEN`.
+4. Deploy.
+5. Deschide Telegram, scrie botului: `/start`, apoi `/watch <link_365scores> [profil]`.
+
+## Comenzi
+- `/watch <link> [agresiv|echilibrat|conservator]`
+- `/status`
+- `/stop`
